@@ -272,97 +272,46 @@ class NeuralNetStockMarket(torch.nn.Module):
         return action
 
     def get_qvals(self, state):
-        """
-        Get Q-values for all actions given a state
-        """
         if type(state) is tuple:
             state = np.array([np.ravel(s) for s in state])
-        state_t = torch.FloatTensor(state).to(self.device)
+        state_t = torch.FloatTensor(state).to(device=self.device)
         return self.model(state_t)
 
+        
 class DQNAgent:
     def __init__(self, env, main_network, buffer, epsilon=0.1, eps_decay=0.99, batch_size=32, min_episodes=300, device=None):
         # Initialize variables
         self.env = env
         self.main_network = main_network
-        self.target_network = deepcopy(main_network)  # Create copy of main network
+        self.target_network = deepcopy(main_network)
         self.buffer = buffer
         self.epsilon = epsilon
         self.eps_decay = eps_decay
         self.batch_size = batch_size
+        self.nblock = 100  # For calculating mean rewards over last 100 episodes
         self.min_episodes = min_episodes
-        self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device("mps")
         
         # Initialize tracking variables
-        self.step_count = 0
-        self.episode_rewards = []  # Store rewards for each episode
-        self.mean_rewards_history = []  # Store mean rewards every 100 episodes
-        self.epsilon_history = []  # Store epsilon values
-        self.loss_history = []  # Store loss values
         self.episodes_train_dqn = 0  # Track number of training episodes
-        
         self.initialize()
 
     def initialize(self):
-        # Set target network weights equal to main network weights initially
-        self.target_network.load_state_dict(self.main_network.state_dict())
-        self.state0 = self.env.reset()[0]
+        # Initialize tracking variables for storing metrics (*)
+        self.training_rewards = []      # Store rewards for each episode
+        self.mean_training_rewards = [] # Store mean rewards every 100 episodes
+        self.update_loss = []          # Store loss values during training
+        self.epsilon_history = []      # Store epsilon values
+        
+        # Other variables
         self.total_reward = 0
-        self.update_loss = []
+        self.step_count = 0
+        self.state0 = self.env.reset()[0]
 
-    def take_step(self, eps, mode='train'):
-        if mode == 'explore':
-            # Random action for exploration
-            action = self.env.action_space.sample()
-        else:
-            # Epsilon-greedy action selection
-            action = self.main_network.get_action(self.state0, eps)
-            self.step_count += 1
-
-        # Take step in environment
-        next_state, reward, terminated, truncated, _ = self.env.step(action)
-        done = terminated or truncated
-        
-        # Store experience in buffer
-        self.buffer.append(self.state0, action, reward, done, next_state)
-        
-        # Update state and accumulate reward
-        self.state0 = next_state
-        self.total_reward += reward
-
-        if done:
-            self.episode_rewards.append(self.total_reward)
-            return True
-        return False
-
-    def calculate_loss(self, batch):
-        states, actions, rewards, dones, next_states = [i for i in batch]
-        rewards_vals = torch.FloatTensor(rewards).to(self.device)
-        actions_vals = torch.LongTensor(np.array(actions)).reshape(-1,1).to(self.device)
-        dones_t = torch.tensor(dones, dtype=torch.bool).to(self.device)
-
-        # Get Q-values from main network
-        qvals = torch.gather(self.main_network.get_qvals(states), 1, actions_vals)
-        
-        # Get next Q-values from target network
-        qvals_next = torch.max(self.target_network.get_qvals(next_states),
-                              dim=-1)[0].detach()
-        qvals_next[dones_t] = 0
-
-        # Calculate expected Q-values using Bellman equation
-        expected_qvals = rewards_vals + self.gamma * qvals_next
-        
-        # Calculate MSE loss
-        loss = F.mse_loss(qvals.squeeze(), expected_qvals)
-        return loss
-
-    def train(self, gamma=0.99, max_episodes=50000,
-              batch_size=32, dnn_update_frequency=4,
-              dnn_sync_frequency=2000, REWARD_THRESHOLD=9000):
-        
+    def train(self, gamma=0.99, max_episodes=50000, batch_size=32,
+              dnn_update_frequency=4, dnn_sync_frequency=2000, REWARD_THRESHOLD=9000):
         self.gamma = gamma
         
-        # Fill replay buffer
         print("Filling replay buffer...")
         while self.buffer.burn_in_capacity() < 1:
             self.take_step(self.epsilon, mode='explore')
@@ -370,41 +319,34 @@ class DQNAgent:
         episode = 0
         training = True
         print("Training...")
+        
         while training:
             self.state0 = self.env.reset()[0]
             self.total_reward = 0
             gamedone = False
             
             while not gamedone:
-                # Take action
                 gamedone = self.take_step(self.epsilon, mode='train')
                 
-                # Update main network according to frequency
+                # Update networks according to frequencies
                 if self.step_count % dnn_update_frequency == 0:
                     self.update()
-                
-                # Sync target network according to frequency
                 if self.step_count % dnn_sync_frequency == 0:
                     self.target_network.load_state_dict(self.main_network.state_dict())
                 
                 if gamedone:
                     episode += 1
-                    self.episodes_train_dqn = episode
+                    self.episodes_train_dqn = episode  # Store number of episodes (*)
                     
-                    # Calculate mean reward over last 100 episodes
-                    mean_rewards = np.mean(self.episode_rewards[-100:])
-                    self.mean_rewards_history.append(mean_rewards)
-                    
-                    # Store epsilon
+                    # Store training metrics (*)
+                    self.training_rewards.append(self.total_reward)
+                    mean_rewards = np.mean(self.training_rewards[-self.nblock:])
+                    self.mean_training_rewards.append(mean_rewards)
                     self.epsilon_history.append(self.epsilon)
                     
-                    # Reset loss tracking for next episode
-                    self.update_loss = []
+                    print(f"\rEpisode {episode} Mean Rewards {mean_rewards:.2f} Epsilon {self.epsilon}\t\t", end="")
                     
-                    print("\rEpisode {:d} Mean Rewards {:.2f} Epsilon {}\t\t".format(
-                        episode, mean_rewards, self.epsilon), end="")
-                    
-                    # Check episode limits
+                    # Check termination conditions
                     if episode >= max_episodes:
                         training = False
                         print('\nEpisode limit reached.')
@@ -412,11 +354,59 @@ class DQNAgent:
                     
                     if mean_rewards >= REWARD_THRESHOLD and episode >= self.min_episodes:
                         training = False
-                        print('\nEnvironment solved in {} episodes!'.format(episode))
+                        print(f'\nEnvironment solved in {episode} episodes!')
                         break
                     
                     # Update epsilon
                     self.epsilon = max(self.epsilon * self.eps_decay, 0.01)
+
+    def take_step(self, eps, mode='train'):
+        if mode == 'explore':
+            # acción aleatoria en el burn-in y en la fase de exploración (epsilon)>
+            action = self.env.action_space.sample() 
+        else:
+            # acción a partir del valor de Q (elección de la acción con mejor Q)
+            action = self.main_network.get_action(self.state0, eps)
+            self.step_count += 1
+        #TODO: tomar 'step' i obtener nuevo estado y recompensa. Guardar la experiencia en el buffer
+        new_state, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+        # new_state, reward, done, _ = self.env.step(action)
+        self.total_reward += reward
+        self.buffer.append(self.state0, action, reward, done, new_state) # guardem experiència en el buffer
+        self.state0 = new_state.copy()
+        
+        #TODO: resetear entorno 'if done'
+        if done:
+            self.training_rewards.append(self.total_reward)
+            self.total_reward = 0
+            self.state0 = env.reset()[0]
+        return done
+
+    def calculate_loss(self, batch):
+      #  print('loss')
+        # Separamos las variables de la experiencia y las convertimos a tensores
+        states, actions, rewards, dones, next_states = [i for i in batch]
+        rewards_vals = torch.FloatTensor(rewards).to(self.device)
+        actions_vals = torch.LongTensor(np.array(actions)).reshape(-1,1).to(self.device)
+        dones_t = torch.tensor(dones, dtype=torch.bool).to(self.device)
+
+        # Obtenemos los valores de Q de la red principal
+        qvals = torch.gather(self.main_network.get_qvals(states), 1, actions_vals).to(self.device)
+        # Obtenemos los valores de Q objetivo. El parámetro detach() evita que estos valores actualicen la red objetivo
+        qvals_next = torch.max(self.target_network.get_qvals(next_states),
+                               dim=-1)[0].detach().to(self.device)
+        qvals_next[dones_t.bool()] = 0
+
+        #################################################################################
+        ### TODO: Calcular ecuación de Bellman
+        expected_q_values = rewards_vals + (self.gamma * qvals_next)  # Shape: (batch_size,)
+        # expected_qvals = None
+
+        #################################################################################
+        ### TODO: Calcular la pérdida (MSE)
+        loss = torch.nn.MSELoss()(qvals, expected_q_values.reshape(-1,1))
+        return loss
 
     def update(self):
         self.main_network.optimizer.zero_grad()  # eliminamos cualquier gradiente pasado
@@ -425,6 +415,80 @@ class DQNAgent:
         loss.backward() # hacemos la diferencia para obtener los gradientes
         self.main_network.optimizer.step() # aplicamos los gradientes a la red neuronal
         # Guardamos los valores de pérdida
-        self.update_loss.append(loss.detach().cpu().numpy())
+        if self.device.type == 'mps':
+            loss_value = loss.detach().to('cpu').item()
+        else:
+            loss_value = loss.detach().cpu().numpy()
+        self.update_loss.append(loss_value)
 
 
+
+# Define hyperparameters
+LEARNING_RATE = 0.0005
+BATCH_SIZE = 128
+MAX_EPISODES = 4000
+BURN_IN = 1000
+UPDATE_FREQ = 6
+SYNC_FREQ = 15
+MEMORY_SIZE = 50000
+GAMMA = 0.99
+EPSILON = 1.0
+EPSILON_DECAY = 0.995
+
+# Calculate REWARD_THRESHOLD
+ticker = 'SPY'
+start = '2019-01-01'
+end = '2021-01-01'
+
+# Download data to get number of trading days
+temp_data = yf.download(ticker, start, end)
+num_days = len(temp_data)
+print(f"Numero de dias de trading para {ticker} desde {start} hasta {end}: {num_days}")
+print(f"Nuestro objetivo ganar el 50 por ciento de los dias: {round(num_days/2)}")
+REWARD_THRESHOLD = round(num_days/2)
+
+# Training
+print("Starting training...")
+start_time = time.time()
+
+# Create environment
+env = StockMarketEnv(ticker=ticker, start=start, end=end)
+
+# Create experience replay buffer
+buffer = experienceReplayBuffer(memory_size=MEMORY_SIZE, burn_in=BURN_IN)
+
+# Create neural network
+main_network = NeuralNetStockMarket(
+    env=env,
+    learning_rate=LEARNING_RATE
+)
+
+# Create DQN agent
+agent = DQNAgent(
+    env=env,
+    main_network=main_network,
+    buffer=buffer,
+    epsilon=EPSILON,
+    eps_decay=EPSILON_DECAY,
+    batch_size=BATCH_SIZE,
+    min_episodes=300
+)
+
+# Train the agent
+agent.train(
+    gamma=GAMMA,
+    max_episodes=MAX_EPISODES,
+    batch_size=BATCH_SIZE,
+    dnn_update_frequency=UPDATE_FREQ,
+    dnn_sync_frequency=SYNC_FREQ,
+    REWARD_THRESHOLD=REWARD_THRESHOLD
+)
+
+# Calculate training time
+end_time = time.time()
+training_time = (end_time - start_time) / 60  # Convert to minutes
+print(f"\nTraining time: {training_time:.2f} minutes")
+
+# Print final results
+print(f"Episodes completed: {agent.episodes_train_dqn}")
+print(f"Final mean reward: {agent.mean_training_rewards[-1]:.2f}")
